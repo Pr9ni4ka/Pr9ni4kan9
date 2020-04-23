@@ -1,171 +1,177 @@
-#include<stdio.h>
-#include<windows.h>
-#include<conio.h>
-#include<time.h>
-#include<iostream>
-#include<string>
+#include <iostream>
+#include <stdio.h>
+#include <termios.h> 
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/shm.h>
+#include <unistd.h>
+#include <sys/sem.h>
+#include <sys/types.h>
+#include <wait.h>
+#include <semaphore.h>
+#include <string.h>
+#include <math.h>
 
 using namespace std;
 
-void Server(char* path);
-void Client();
-
-
-
-int main(int argc, char* argv[])
+union semun 
 {
-	switch(argc)
+	int              val;    /* Value for SETVAL */
+	struct semid_ds *buf;    /* Buffer for IPC_STAT, IPC_SET */
+	unsigned short  *array;  /* Array for GETALL, SETALL */
+	struct seminfo  *__buf;  /* Buffer for IPC_INFO
+(Linux-specific) */
+} semunion;
+
+void WaitSemaphore(int sem_id, int num);
+void ReleaseSemaphore(int sem_id, int num);
+
+
+int main(int argc, char *argv[])
+{  
+	int bufferSize = 20; // Размер буфера
+	int shm_id = shmget(IPC_PRIVATE, bufferSize, IPC_CREAT|0666); // Создание сегмента разделяемой памяти
+
+	if (shm_id < 0) 
 	{
-	case 1:
-		Server(argv[0]);		
-		break;
+		printf("shmget error\n");
+		return(0);
+	} 
 
-	default:
-		Client();		
+	int NumberOfBlocks; // Количество блоков размером с буфер
+	int length;	      // Длина передаваемой строки
+
+	system("clear");
+	string message;
+
+	// Создание набора семафоров
+	int sem_id = semget(IPC_PRIVATE, 4, IPC_CREAT|0666);
+	semctl(sem_id, 0, SETALL, 0);
+	if(sem_id < 0)
+	{
+		printf("Semaphores is not created.");
+		return 0;
+	}
+
+	int pid = fork();
+	switch(pid)
+	{
+	case -1:
+		printf("New process is not created\n");
+		return 0;
+		
+	case 0: // Дочерний процесс
+		{
+			void *buffer = shmat(shm_id, NULL, 0);
+			while(1)
+			{
+				message.clear();
+				WaitSemaphore(sem_id, 2); // Ожидание, пока счётчик семафора не станет равным 1
+				// и сброс в 0 по окончании ожидания
+				
+				WaitSemaphore(sem_id, 0);
+				length = *(int*)buffer;	
+				ReleaseSemaphore(sem_id, 1);	
+				
+				if(length == -1) break;  // Выход из программы
+				
+				NumberOfBlocks = ceil((double)length / (double)bufferSize); // Количество блоков размером с буфер
+				for( int i=0; i < NumberOfBlocks; i++)
+				{
+					WaitSemaphore(sem_id, 0);					
+					message.append((char*)buffer, bufferSize); // Добавляем полученный буфер в строку
+					ReleaseSemaphore(sem_id, 1);
+				}
+				
+				message.resize(length);
+				cout << "\nChild process:\n";// << message << "\n\n\n";
+
+				for(int i = 0; i < length; i++)
+				{
+					putchar(message[i]);
+					fflush(stdout);
+					usleep(100000);
+				}
+				cout<<"\n\n\n";
+				
+				ReleaseSemaphore(sem_id, 3);		  
+			}
+			
+			
+		}
+		break;
+		
+	default: // Родительский процесс
+		{
+			void *buffer = shmat(shm_id, NULL, 0);
+			while(1)
+			{
+				message.clear();
+				cout<<"Parent process:\n";
+				system("stty echo");
+				tcflush(STDIN_FILENO, TCIFLUSH);
+				getline(cin, message);
+				system("stty -echo");
+				
+				ReleaseSemaphore(sem_id, 2);	// уведомление о готовности
+				
+				if(message == "quit")
+				{
+					length = -1;	
+					*(int*)buffer = length;
+					ReleaseSemaphore(sem_id, 0);
+					WaitSemaphore(sem_id, 1);    // Ожидаем получения сообщения					
+					waitpid(pid, NULL, 0);
+					break;
+				}			
+				
+				length = message.size();
+				*(int*)buffer = length;
+				
+				ReleaseSemaphore(sem_id, 0);	// сообщаем о передаче сообщения
+				WaitSemaphore(sem_id, 1);    // Ожидаем получения сообщения
+				
+				NumberOfBlocks = ceil((double)length / (double)bufferSize); // Количество блоков размером с буфер
+				for(int i = 0; i < NumberOfBlocks; i++)
+				{					
+					message.copy((char*)buffer, bufferSize, i*bufferSize);	// Заполняем буфер
+					
+					ReleaseSemaphore(sem_id, 0);	// сообщаем о передаче сообщения
+					WaitSemaphore(sem_id, 1);    // Ожидаем получения сообщения
+				}	
+				
+				WaitSemaphore(sem_id, 3);  // Ожидание, пока счётчик семафора не станет равным 1
+				// и сброс в 0 по окончании ожидания
+			}
+			
+			semctl(sem_id, 0, IPC_RMID, semunion); // Удаляем набор семафоров
+		}
 		break;
 	}
+
+	system("clear"); 
+	system("stty echo");
+	return 0;
 }
 
 
-
-void Server(char* path)
+// Ожидание, пока счётчик семафора не станет равным 1
+// и сброс в 0 по окончании ожидания
+void WaitSemaphore(int sem_id, int num)
 {
-	STARTUPINFO si;
-	ZeroMemory( &si, sizeof(si) );
-	si.cb = sizeof(si);
-
-	PROCESS_INFORMATION childProcessInfo;
-	ZeroMemory(&childProcessInfo, sizeof(childProcessInfo));
-
-	HANDLE hMyPipe;
-	HANDLE Semaphores[3];	
-
-	char buffer[20];				 // Буфер для передачи
-	int bufferSize = sizeof(buffer); // Размер буфера
-
-	string message;
-
-
-	Semaphores[0] = CreateSemaphore(NULL, 0 , 1, "SEMAPHORE_lab3");      // Семафор, уведомляющий о разрешении печати
-	Semaphores[1] = CreateSemaphore(NULL, 0 , 1, "SEMAPHORE_end_lab3");      // Семафор, уведомляющий о разрешении печати
-	Semaphores[2] = CreateSemaphore(NULL, 0 , 1, "SEMAPHORE_EXIT_lab3");	// Семафор, уведомляющий о завершении работы			
-
-	cout<<"Server process\n\n";
-
-	hMyPipe = CreateNamedPipe("\\\\.\\pipe\\MyPipe",PIPE_ACCESS_OUTBOUND,PIPE_TYPE_MESSAGE|PIPE_WAIT,PIPE_UNLIMITED_INSTANCES ,0,0,INFINITE,(LPSECURITY_ATTRIBUTES)NULL);
-
-	CreateProcess(path, " 2", NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &childProcessInfo);
-
-	if(!ConnectNamedPipe(hMyPipe,(LPOVERLAPPED)NULL))
-		cout<<"Connection failure\n";
-
-	while(1)
-	{				
-		DWORD NumberOfBytesWritten;
-
-		cout << "\nEnter message:\n";
-		cin.clear();
-		getline(cin, message);
-
-
-		if(message == "quit")
-		{
-			ReleaseSemaphore(Semaphores[2], 1, NULL);  // Сообщаем дочернему процессу о завершении работы
-			WaitForSingleObject(childProcessInfo.hProcess, INFINITE);
-			break;
-		}
-
-		ReleaseSemaphore(Semaphores[0], 1, NULL);   // Сообщаем дочернему процессу о готовности начала передачи данных
-
-		cout << "w1\n";
-		int NumberOfBlocks = message.size() / bufferSize + 1;	// Количество блоков размером с буфер			
-		WriteFile(hMyPipe, &NumberOfBlocks, sizeof(NumberOfBlocks), &NumberOfBytesWritten, (LPOVERLAPPED)NULL);
-
-		cout << "w2\n";
-		int size = message.size();
-		WriteFile(hMyPipe, &size, sizeof(size), &NumberOfBytesWritten, (LPOVERLAPPED)NULL);
-
-		cout << "w_blocks\n";
-		for(int i = 0; i < NumberOfBlocks; i++)
-		{					
-			message.copy(buffer, bufferSize, i*bufferSize);		// Заполняем буфер
-			if(!WriteFile(hMyPipe, buffer, bufferSize, &NumberOfBytesWritten,(LPOVERLAPPED)NULL)) cout<<"Write Error\n";
-		}				
-
-		WaitForSingleObject(Semaphores[1], INFINITE); // Ожидание, пока клиентский процесс не напечатал строку
-	}			
-
-	CloseHandle(hMyPipe);
-	CloseHandle(Semaphores[0]);
-	CloseHandle(Semaphores[1]);
-	cout << "\n\n";
-	system("pause");
-	return;
+	struct sembuf buf;
+	buf.sem_op = -1;
+	buf.sem_flg = SEM_UNDO;
+	buf.sem_num = num;
+	semop(sem_id, &buf, 1);	
 }
 
-void Client()
+// Установить счётчик семафора в 1
+void ReleaseSemaphore(int sem_id, int num)
 {
-	HANDLE hMyPipe;
-	HANDLE Semaphores[3];	
-
-	char buffer[20];				 // Буфер для передачи
-	int bufferSize = sizeof(buffer); // Размер буфера
-
-	string message;
-
-	bool successFlag;
-	Semaphores[0] = OpenSemaphore(SEMAPHORE_ALL_ACCESS, TRUE, "SEMAPHORE_lab3");
-	Semaphores[1] = OpenSemaphore(SEMAPHORE_ALL_ACCESS, TRUE, "SEMAPHORE_end_lab3");
-	Semaphores[2] =  OpenSemaphore(SEMAPHORE_ALL_ACCESS, TRUE, "SEMAPHORE_EXIT_lab3");
-
-	cout<<"Child process\n\n";
-
-	hMyPipe = CreateFile("\\\\.\\pipe\\MyPipe",GENERIC_READ,FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
-
-
-	while(1)
-	{				
-		successFlag = TRUE;
-		DWORD NumberOfBytesRead;
-		message.clear();
-
-		int index = WaitForMultipleObjects(3, Semaphores, FALSE, INFINITE) - WAIT_OBJECT_0; // Получил уведомление о возможности чтения, семафор занят
-		if (index == 2) // Если сигнальный семафор выхода
-			break;					
-
-		//				cout<<"\n\t\t\tServer is ready to send message\n";
-
-		int NumberOfBlocks;
-		if(!ReadFile(hMyPipe, &NumberOfBlocks, sizeof(NumberOfBlocks), &NumberOfBytesRead, NULL)) break;
-
-		int size;
-		if(!ReadFile(hMyPipe, &size, sizeof(size), &NumberOfBytesRead, NULL)) break;
-
-		for( int i=0; i < NumberOfBlocks; i++)
-		{
-			successFlag = ReadFile(hMyPipe, buffer, bufferSize, &NumberOfBytesRead, NULL);
-			if(!successFlag) break;
-
-			message.append(buffer, bufferSize); // Добавляем полученный буфер в строку
-		}
-		if(!successFlag) break;
-
-		message.resize(size);
-
-	//	cout << message << "\n\n";
-		for(int i =0; i < size; i++)
-		{
-			cout << message[i];
-			Sleep(100);
-		}
-		cout<<endl;
-		//				cout<<"\n\t\t\tMessage was printed successfully\n";
-
-		ReleaseSemaphore(Semaphores[1], 1, NULL);		// Уведомление родительского процесса об успешном получении строки
-//		Sleep(6000);
-	}
-	CloseHandle(hMyPipe);
-	CloseHandle(Semaphores[0]);
-	CloseHandle(Semaphores[1]);
-	return;
+	struct sembuf buf;
+	buf.sem_op = 1;
+	buf.sem_flg = SEM_UNDO;
+	buf.sem_num = num;
+	semop(sem_id, &buf, 1); 
 }
