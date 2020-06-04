@@ -1,168 +1,151 @@
-#include <errno.h>
-#include <pthread.h>
+// Mylab5.cpp : Defines the entry point for the console application.
+#include <windows.h>
+#include <process.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <aio.h>
-#include <sys/stat.h>
-#include <dlfcn.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <string.h>
-#include <fcntl.h>
+#include <string>
+typedef HANDLE(_cdecl* LPFNDLLinit)(char *, char *);
+
+using namespace std;
+
+DWORD WINAPI WriterThread(PVOID pvParam);
+DWORD WINAPI ReaderThread(PVOID argv);
+
+#define read_finished_event 0
+#define exit_event 1
+#define write_finished_event 2
 
 struct OperationInfo
 {
-  int hFile;			// Р”РµСЃРєСЂРёРїС‚РѕСЂ С„Р°Р№Р»Р°
-  char  buf[100];
-  size_t NumberOfBytes;
-  size_t NumberOfBytesTransferred;
-  off_t pos_in_file;
-  off_t pos_out_file;
-  struct aiocb aiocbStruct;
+    HANDLE hFile;             // Дескриптор обрабатываемого в данный момент файла
+	DWORD NumberOfBytes;	  // Количество байт для чтения/записи
+    CHAR  buf[100];			  // Буфер чтения/записи
+	DWORD  pos_in_file;		  // Позиция в файле для чтения
+	DWORD  pos_out_file;	  // Позиция в выходном файле
+	OVERLAPPED Overlapped;
 } info;
 
-void* ReaderThread(void * );
-void* WriterThread(void * );
+HINSTANCE library;
+HANDLE events[3];
 
-int (*read_async) (struct OperationInfo *);
-int (*write_async) (struct OperationInfo *);
-
-pthread_mutex_t write_completed = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t read_completed = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutex_exit = PTHREAD_MUTEX_INITIALIZER;
 
 int main(int argc, char *argv[])
 {
-  if(argc!=3)
-  {
-    printf("arguments error");
-    return 0;
-  }
-  
-  void *lib = dlopen("./libLab5.so",RTLD_NOW);
-  
-  if(lib == NULL)
-  {
-    printf("Library ERROR");
-    return 0;
-  }
-  
-  read_async =(int(*)(struct OperationInfo*)) dlsym(lib,"read_async");
-  write_async = (int(*)(struct OperationInfo*))dlsym(lib,"write_async");  
-  
-  pthread_mutex_lock(&read_completed);
-  pthread_mutex_lock(&mutex_exit);
-  
-  pthread_t hThread_read, hThread_write;
-  
-  info.aiocbStruct.aio_offset = 0;
-  info.aiocbStruct.aio_buf = info.buf;
-  info.NumberOfBytes = sizeof(info.buf);
-  info.aiocbStruct.aio_sigevent.sigev_notify = SIGEV_NONE;
-  info.pos_in_file = 0;
-  info.pos_out_file = 0;
-  
-  pthread_create(&hThread_read,NULL,ReaderThread, (void *)argv[1]);
-  pthread_create(&hThread_write,NULL,WriterThread, (void *)argv[2]);
-  
-  
-  pthread_join(hThread_read, NULL);
-  pthread_join(hThread_write, NULL);
+	
+	library = LoadLibrary("library.dll");
+	
+	if(argc!=3)
+	{
+		printf("arguments error\n");
+		return 0;
+	}
 
-  dlclose(lib);
+
+	HANDLE hEvent;        // дескриптор события для OVERLAPPED
+	HANDLE hThreads[2];   // Дескрипторы потока-писателя и потока-читателя
+
+	hEvent = CreateEvent (NULL, FALSE, TRUE, TEXT("Event_lab5"));  // Сигнальное, автосброс
+
+	events[write_finished_event] = CreateEvent (NULL, FALSE, TRUE, NULL);   // Автосброс, начальное состояние - сигнальное
+	events[read_finished_event] = CreateEvent (NULL, FALSE, FALSE, NULL);  // Автосброс, начальное состояние - несигнальное
+	events[exit_event] = CreateEvent (NULL, TRUE, FALSE, NULL);            // Ручной сброс, начальное состояние - несигнальное
+	 
+	info.Overlapped.Offset = 0;
+	info.Overlapped.OffsetHigh = 0;
+	info.Overlapped.hEvent = hEvent;
+	info.pos_out_file = 0;
+	info.NumberOfBytes = sizeof(info.buf);
+    
   
-  printf("\nOperation complete...\n\n");
-  return 0;
+	hThreads[0] = CreateThread(NULL, 0, WriterThread, (LPVOID)argv[2], 0, NULL); // Поток-писатель (аргумент - путь к выходному файлу)
+	hThreads[1] = CreateThread(NULL, 0, ReaderThread, (LPVOID)argv[1], 0, NULL); // Поток-читатель (аргумент - путь к папке с текстовыми файлами)
+
+	WaitForMultipleObjects(2, hThreads, TRUE, INFINITE);
+
+	CloseHandle(hThreads[0]);
+	CloseHandle(hThreads[1]);
+
+	CloseHandle(events[write_finished_event]);
+	CloseHandle(events[read_finished_event]);
+	CloseHandle(events[exit_event]);
+	CloseHandle(hEvent);
+	FreeLibrary(library);
+	printf("\n\n");
+	return 0;
 }
 
-void* ReaderThread(void *folder_path)
+
+DWORD WINAPI ReaderThread(PVOID folderPATH)
 {
-  DIR *folder;
-  struct dirent entry;
-  struct dirent *result;
-  const char* folderPATH = (const char*) folder_path;
-  
-  folder = opendir(folderPATH);
-  if(folder == NULL)
-  {
-    printf("\nOpenDir ERROR");
-    return NULL;
-  }
-  int hReadFile;
-  char ReadFilePATH[256];
-  
-  int readResult = 0;
-  
-  while ( readdir_r(folder, &entry, &result) == 0 && result != NULL)
-  {
-    if( strcmp( entry.d_name, "." ) != 0 && strcmp( entry.d_name, ".." ) != 0 )
-      break;
-  } 
-  if (result == NULL)
-  {
-    printf("\nFolder is empty");
-    return NULL;
-  }
-  
-  while(1)
-  {
-    pthread_mutex_lock(&write_completed);
- 
-    if(readResult == 0)
+	string folder(((const char*)folderPATH));               // Путь к папке с файлами
+	folder.append("\\");
+	string fileMask = folder + "*.txt";   // Тип файлов для поиска
+	char ReadFilePATH[MAX_PATH];
+
+	WIN32_FIND_DATA FindFileData; // информация о найденных файлах
+	HANDLE find_Handle,  // Дескриптор поиска
+           hReadFile;    // дескриптор файла для чтения
+
+	BOOL readResult = false;
+
+	BOOL (*Read)(OperationInfo*) = (BOOL (*)(OperationInfo*))GetProcAddress(library,"read"); // Функция чтения
+
+	find_Handle = FindFirstFile(fileMask.c_str(), &FindFileData);
+
+	if (find_Handle == INVALID_HANDLE_VALUE) 
     {
-      info.pos_in_file = 0;
-      
-      strcpy(ReadFilePATH, folderPATH); strcat(ReadFilePATH, "/");
-      strcat(ReadFilePATH, entry.d_name);  // РџРѕР»СѓС‡Р°РµРј РїСѓС‚СЊ Рє С‚РµРєСѓС‰РµРјСѓ С‡РёС‚Р°РµРјРѕРјСѓ С„Р°Р№Р»Сѓ
-      
-      hReadFile = open(ReadFilePATH, O_RDONLY);
-    }
-    info.hFile = hReadFile;
-    
-    readResult = read_async(&info);
+        printf (" Error: %d\n", GetLastError ());
+		return 0;
+    } 
 
-    if(readResult == 0)
-    {    
-      printf("\n%s added...", entry.d_name);
-      while ( readdir_r(folder, &entry, &result) == 0 && result != NULL)
-      {
-	if( strcmp( entry.d_name, "." ) != 0 && strcmp( entry.d_name, ".." ) != 0 )
-	  break;
-      }      
-      
-      if (result != NULL)
-      {
-	close(hReadFile);
-	pthread_mutex_unlock(&write_completed);
-	continue;
-      }
-      else break;
-    }
-    pthread_mutex_unlock(&read_completed);
-  }
-  
-  pthread_mutex_unlock(&mutex_exit); // РњСЊСЋС‚РµРєСЃ РІС‹С…РѕРґР°
-  pthread_mutex_unlock(&read_completed);
-  close(hReadFile);
-  return NULL;
+	while(1)
+	{   
+		WaitForSingleObject(events[write_finished_event], INFINITE);
+		if(readResult == false)
+		{
+			info.pos_in_file = 0;
+			strcpy(ReadFilePATH, folder.c_str());
+			strcat(ReadFilePATH, FindFileData.cFileName);  // Получаем путь к текущему читаемому файлу
+			hReadFile = CreateFile(ReadFilePATH, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+		}
+		info.hFile = hReadFile;
+		printf("\nStart read from %s", ReadFilePATH);
+		readResult = (Read)(&info);	// Прочитать из файла
+
+		if(readResult == false && GetLastError() == ERROR_HANDLE_EOF) // Если достигнут конец файла
+		{
+			if(FindNextFile(find_Handle, &FindFileData)) 
+			{
+				printf("\nRead from %s", ReadFilePATH);
+				CloseHandle(hReadFile);
+				SetEvent(events[write_finished_event]);
+				continue;
+			}
+			else break;
+		}
+		
+		SetEvent(events[read_finished_event]);
+	}
+	FindClose(find_Handle);
+	CloseHandle(hReadFile);
+	SetEvent(events[exit_event]);
+	return 0;
 }
 
-void* WriterThread(void * OutFilePATH)
+DWORD WINAPI WriterThread(PVOID outFilePath)
 {
-  const char* OutputFilePATH = (const char*) OutFilePATH;
-  int hOutputFile = open(OutputFilePATH, O_WRONLY | O_CREAT | O_APPEND, S_IRWXU | S_IWUSR | S_IRGRP | S_IROTH);
-  while(1)
-  {   
-    pthread_mutex_lock(&read_completed);
-    if(pthread_mutex_trylock(&mutex_exit) == 0)
-      break;    
-
-    info.hFile = hOutputFile;
-    write_async(&info);
-    
-    pthread_mutex_unlock(&write_completed);
-  }
-  close(hOutputFile);
-  return NULL; 
+	HANDLE hOutputFile = CreateFile((const char*)outFilePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_OVERLAPPED, NULL);
+	BOOL (*Write)(OperationInfo*) = (BOOL (*)(OperationInfo*))GetProcAddress(library,"write"); // Функция записи
+	HANDLE events_[2] = {events[read_finished_event], events[exit_event]  };
+	while(1)
+	{   
+		int event = WaitForMultipleObjects(2, events_, FALSE, INFINITE) - WAIT_OBJECT_0;
+		if(event == exit_event)
+			break;
+		printf("\nStart write to %s", (const char*)outFilePath);
+		info.hFile = hOutputFile;
+        (Write)(&info);
+        SetEvent(events[write_finished_event]);
+	}
+	CloseHandle(hOutputFile);
+	return 0;
 }
